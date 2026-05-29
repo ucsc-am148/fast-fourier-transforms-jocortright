@@ -33,8 +33,14 @@ def make_radix2_twiddles(
     Used by the radix-2 butterfly: stage s reads twiddle at index
     (k & (2**s - 1)) * (N >> (s+1)), so the table only needs the lower half
     of one full period."""
-    raise NotImplementedError("TODO: implement make_radix2_twiddles")
-
+    # define k values
+    k = torch.arange(N//2, dtype = dtype)
+    
+    # calculate and store twiddles
+    tw_re = torch.cos(-2*math.pi*k/N)
+    tw_im = torch.sin(-2*math.pi*k/N)
+    
+    return (tw_re.to(device), tw_im.to(device))
 
 # =============================================================================
 # Pattern 2: per-stage radix-16 twiddles  (F4; reused by F5/F6/F7 via F4)
@@ -79,8 +85,27 @@ def make_radix16_twiddles(
     where e_{L-1-j}_value(c) reads the base-16 digit of c at the position
     given by _column_axis_labeling(L)[s].
     """
-    raise NotImplementedError("TODO: implement make_radix16_twiddles")
-
+    # initialize variables
+    L = math.ceil(math.log2(N)/math.log2(16.0))
+    k = torch.arange(16, dtype = torch.float16)
+    
+    # initialize arrays
+    tw_re = torch.ones((L, 16, N//16), dtype = torch.float16)
+    tw_im = torch.zeros((L, 16, N//16), dtype = torch.float16)   
+    
+    # populate arrays
+    for s in range(L):
+        # skip first stage
+        if s != 0:
+            # define variables
+            K = N/(16**(s + 1))
+            omega = -2.0*math.pi*(k[:, None]*torch.arange(N//16, dtype = torch.float16)*K)/N
+            
+            # insert into arrays
+            tw_re[s] = torch.cos(omega)
+            tw_im[s] = torch.sin(omega)
+            
+    return (tw_re.to(device), tw_im.to(device))
 
 # =============================================================================
 # Pattern 3: Bailey cross-term twiddles  (F3, F5, F6, F7)
@@ -100,8 +125,15 @@ def make_bailey_cross_twiddles(
     F5/F6/F7 call it with dtype=torch.float16 (the tcFFT tier is fp16). The
     Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
     """
-    raise NotImplementedError("TODO: implement make_bailey_cross_twiddles")
-
+    # define indices
+    m0_idx = torch.arange(m0, dtype = dtype)
+    M_idx = torch.arange(M, dtype = dtype)
+    
+    # calculate and store twiddles
+    tw_re = torch.cos(-2*math.pi*(m0_idx[:, None]*M_idx[None, :])/N)
+    tw_im = torch.sin(-2*math.pi*(m0_idx[:, None]*M_idx[None, :])/N)
+    
+    return (tw_re.to(device), tw_im.to(device))
 
 # =============================================================================
 # Scaffolding tables
@@ -116,8 +148,17 @@ def make_dft_matrix(
 
     W[j, k] = exp(-2*pi*i * j * k / N). Used by F1 (DFT-as-complex-matmul).
     """
-    raise NotImplementedError("TODO: implement make_dft_matrix")
+    # initialize arrays
+    W_re = torch.zeros((N, N), dtype = dtype)
+    W_im = torch.zeros((N, N), dtype = dtype)
+    
+    # populate arrays
+    for k in range(N):
+        for j in range(N):
+            W_re[j, k] = math.cos(-2*math.pi*j*k/N)
+            W_im[j, k] = math.sin(-2*math.pi*j*k/N)
 
+    return (W_re.to(device), W_im.to(device))
 
 def make_dft_R_padded(
     R: int,
@@ -129,8 +170,18 @@ def make_dft_R_padded(
     first R columns are F_R (rows wrap mod R), take the first R output rows.
     This makes the >=16x16 tl.dot requirement hold for all R in {2, 4, 8, 16}.
     """
-    raise NotImplementedError("TODO: implement make_dft_R_padded")
+    # calculate dft matrix
+    (dft_re, dft_im) = make_dft_matrix(R, torch.float16, device)
+    
+    # initialize arrays
+    M_re = torch.zeros((16, 16), dtype = torch.float16)
+    M_im = torch.zeros((16, 16), dtype = torch.float16)
 
+    # insert dft matrix into arrays; overwrite zeros starting from [0, 0]
+    M_re[:dft_re.size(0), :dft_re.size(1)] = dft_re
+    M_im[:dft_im.size(0), :dft_im.size(1)] = dft_im
+
+    return (M_re.to(device), M_im.to(device))
 
 def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
     """Length-N bit-reversal permutation as a (N,) int32 tensor.
@@ -138,4 +189,14 @@ def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
     rev[i] is the integer whose n_bits=log2(N) binary representation is i's
     bits in reversed order.
     """
-    raise NotImplementedError("TODO: implement bit_reversal_perm")
+    # initialize variables
+    n_bits = math.ceil(math.log2(N))
+    idx = torch.arange(N, dtype = torch.int32)
+    rev = torch.zeros((N,), dtype = torch.int32)
+    
+    # populate rev array
+    for i in range(n_bits):
+        rev = (rev << 1) | (idx & 1)
+        idx = idx >> 1
+
+    return rev.to(device)

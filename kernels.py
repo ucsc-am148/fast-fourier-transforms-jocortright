@@ -36,7 +36,6 @@ TRANSPOSE_BLOCK = 32
 # =============================================================================
 # Implement this once -- f1_kernel, f4_kernel_L2, and dft_kernel all call it.
 
-
 @triton.jit
 def _cdot(a_re, a_im, b_re, b_im):
     """Complex matmul Y = A @ B as four real tl.dot calls.
@@ -50,8 +49,15 @@ def _cdot(a_re, a_im, b_re, b_im):
 
     TODO: implement.
     """
-    pass
+    rere = tl.dot(a_re, b_re, out_dtype = tl.float32)
+    imim = tl.dot(a_im, b_im, out_dtype = tl.float32)
+    imre = tl.dot(a_im, b_re, out_dtype = tl.float32)
+    reim = tl.dot(a_re, b_im, out_dtype = tl.float32)
 
+    y_re = rere - imim
+    y_im = imre + reim
+
+    return y_re, y_im
 
 # =============================================================================
 # Chunk factorization for F6 / F7
@@ -68,11 +74,16 @@ def f6_factor(N: int) -> list[int]:
         65536 -> [256, 256]         1048576 -> [256, 256, 16]
         64 -> [16, 4]               2 -> [2]
     """
-    raise NotImplementedError("TODO: implement f6_factor")
-
+    assert N >= 2 and (N & (N - 1)) == 0, f"N must be a power of 2 >= 2; got {N}"
+    k = N.bit_length() - 1
+    n256, rb = divmod(k, 8)
+    n16, rb2 = divmod(rb, 4)
+    rsmall = 1 << rb2
+    chunks = [256] * n256 + [16] * n16 + ([rsmall] if rsmall > 1 else [])
+    assert math.prod(chunks) == N
+    return chunks
 
 f7_factor = f6_factor   # F7 reuses F6's chunk recipe
-
 
 # =============================================================================
 # F1: DFT as one dense complex matmul (four tl.dot)
@@ -104,8 +115,58 @@ def f1_kernel(
 
     TODO: implement.
     """
-    pass
+    # program ids
+    pid_b = tl.program_id(axis = 0)
+    pid_n = tl.program_id(axis = 1)
+    
+    # offsets for rows and column
+    b_offs = pid_b*BLOCK_M + tl.arange(0, BLOCK_M) # how far across for x
+    n_offs = pid_n*BLOCK_N + tl.arange(0, BLOCK_N) # how far across for W
+    
+    # define masks
+    b_mask = b_offs[:, None] < B
+    n_mask = n_offs[None, :] < N    
 
+    # initialize accumulators
+    acc_re = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
+    acc_im = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
+
+    for k in range (0, N, BLOCK_K):
+        # define offset and mask for k
+        k_offs = k + tl.arange(0, BLOCK_K)
+        x_k_mask = k_offs[None, :] < N
+        W_T_k_mask = k_offs[:, None] < N
+
+        # define offsets for x
+        x_offs = b_offs[:, None]*N + k_offs[None, :]
+
+        # define offsets for W_T
+        W_T_offs = n_offs[None, :]*N + k_offs[:, None]
+        
+        # define masks
+        x_mask = b_mask & x_k_mask
+        W_T_mask = W_T_k_mask & n_mask
+
+        # load matrices
+        x_re = tl.load(x_re_ptr + x_offs, mask = x_mask, other = 0.0)
+        x_im = tl.load(x_im_ptr + x_offs, mask = x_mask, other = 0.0)
+        W_T_re = tl.load(W_re_ptr + W_T_offs, mask = W_T_mask, other = 0.0)
+        W_T_im = tl.load(W_im_ptr + W_T_offs, mask = W_T_mask, other = 0.0)
+
+        # update accumulators
+        y_re, y_im = _cdot(x_re, x_im, W_T_re, W_T_im)
+        acc_re += y_re
+        acc_im += y_im
+        
+    # define offset
+    offs = b_offs[:, None]*N + n_offs[None, :]
+    
+    # define mask
+    mask = b_mask & n_mask
+
+    # store results
+    tl.store(y_re_ptr + offs, acc_re, mask = mask)
+    tl.store(y_im_ptr + offs, acc_im, mask = mask)
 
 def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
     """Grid: (cdiv(B, BLOCK_M), cdiv(N, BLOCK_N)). One program tiles a
@@ -114,8 +175,20 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f1_launch")
-
+    # dimensions
+    B, N = x_re.shape()
+ 
+    # block sizes
+    BLOCK_M = 16
+    BLOCK_N = 32
+    BLOCK_K = 16
+    
+    # grid
+    grid = (triton.cdiv(B, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    
+    # function call
+    f1_kernel[grid](x_re, x_im, W_re, W_im, y_re, y_im, B, N,
+                    BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K)
 
 # =============================================================================
 # F2: radix-2 Cooley-Tukey, single program per signal
@@ -154,16 +227,131 @@ def f2_kernel(
 
     TODO: implement.
     """
-    pass
+    # program ids
+    pid = tl.program_id(axis = 0)
 
+    # define offset for perm vector
+    range_N = tl.arange(0, N) 
+
+    # define masks
+    perm = tl.load(perm_ptr + range_N)
+    
+    # define x offset
+    x_offs = pid*N + perm
+
+    # load x vectors
+    x_re = tl.load(x_re_ptr + x_offs)
+    x_im = tl.load(x_im_ptr + x_offs)
+
+    # define duplicate vectors to be manipulated
+    v_re = x_re
+    v_im = x_im
+
+    # run each butterfly level
+    for s in tl.static_range(0, LOG2_N):
+        # calculate cutoff
+        half = 1 << s
+        full = half << 1
+
+        # calculate position
+        less_full = full - 1
+        pos = range_N & less_full
+        
+        # decide if in low or high half
+        low_half = pos < half
+
+        # define offsets
+        lo_offs = tl.where(low_half, range_N, range_N - half)
+        hi_offs = lo_offs + half
+
+        # accumulate low values
+        lo_re = v_re.gather(lo_offs, axis=0)
+        lo_im = v_im.gather(lo_offs, axis=0)
+
+        # accumulate high values
+        hi_re = v_re.gather(hi_offs, axis=0)
+        hi_im = v_im.gather(hi_offs, axis=0)
+
+        # index into the radix-2 twiddle table
+        tw_offs = (lo_offs & (half - 1)) * (N >> (s + 1))
+
+        # load temporary pointers
+        tmp_re = tl.load(tw_re_ptr + tw_offs)
+        tmp_im = tl.load(tw_im_ptr + tw_offs)
+
+        # update and twiddle
+        tw_re = tmp_re*hi_re - tmp_im*hi_im
+        tw_im = tmp_re*hi_im + tmp_im*hi_re
+
+        # update low values
+        low_re_outs = lo_re + tw_re
+        low_im_outs = lo_im + tw_im
+
+        # update high values
+        high_re_outs = lo_re - tw_re
+        high_im_outs = lo_im - tw_im
+
+        # update v to v_new
+        v_re = tl.where(low_half, low_re_outs, high_re_outs)
+        v_im = tl.where(low_half, low_im_outs, high_im_outs)
+    
+# for F3 -----------------------------------------------------------------------
+    if BAILEY_EPILOGUE:
+        # calculate bailey twiddle offsets
+        bt_offs = (pid % OUTER_DIM)*N + range_N
+
+        # load bailey twiddle vectors
+        bt_re = tl.load(bt_re_ptr + bt_offs)
+        bt_im = tl.load(bt_im_ptr + bt_offs)
+
+        # calculate new v
+        v_re_new = v_re*bt_re - v_im*bt_im
+        v_im_new = v_re*bt_im + v_im*bt_re
+
+        # update v
+        v_re = v_re_new
+        v_im = v_im_new
+
+    if STRIDED_STORE:
+        # calculate stride
+        stride = pid//OUTER_DIM
+
+        # calculate y offsets
+        y_offs = pid + OUTER_DIM*range_N + stride*(N_TOTAL - OUTER_DIM)
+    
+    else:
+        # calculate y offsets without striding
+        y_offs = pid*N + range_N
+    
+    # store results
+    tl.store(y_re_ptr + y_offs, v_re)
+    tl.store(y_im_ptr + y_offs, v_im)
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
     """Grid: (B,). One program per length-N signal. Vanilla mode.
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f2_launch")
+    # dimensions
+    B, N = x_re.shape()
+    LOG2_N = math.log2(N)
 
+    # booleans
+    BAILEY_EPILOGUE = False
+    STRIDED_STORE = False
+
+    # unused constants
+    OUTER_DIM = 0
+    N_TOTAL = 0
+
+    # grid definition
+    grid = (B,)
+
+    #function call
+    f2_kernel[grid](x_re, x_im, y_re, y_im, tw_re, tw_im, perm,
+                    OUTER_DIM = OUTER_DIM, N_TOTAL = N_TOTAL, N = N,
+                    LOG2_N = LOG2_N, BAILEY_EPILOGUE = BAILEY_EPILOGUE,
+                    STRIDED_STORE = STRIDED_STORE)
 
 # =============================================================================
 # transpose_kernel: (B, R, C) -> (B, C, R), paired re/im
@@ -182,8 +370,34 @@ def transpose_kernel(
 
     TODO: implement.
     """
-    pass
+    # define program ids
+    b_pid = tl.program_id(axis = 0)
+    r_pid = tl.program_id(axis = 1)
+    c_pid = tl.program_id(axis = 2)
 
+    # define offsets
+    r_offs = r_pid*BLOCK_R + tl.arange(0, BLOCK_R)
+    c_offs = c_pid*BLOCK_C + tl.arange(0, BLOCK_C)
+    x_offs = b_pid*R*C + r_offs[None, :, None]*C + c_offs[None, None, :]
+    y_offs = b_pid*R*C + c_offs[None, :, None]*R + r_offs[None, None, :]
+
+    # define masks
+    r_mask = r_offs < R
+    c_mask = c_offs < C
+    x_mask = r_mask[:, None] & c_mask[None, :]
+    y_mask = r_mask[None, :] & c_mask[:, None]
+
+    # load vectors
+    x_re = tl.load(x_re_ptr + x_offs, mask = x_mask, other = 0.0)
+    x_im = tl.load(x_im_ptr + x_offs, mask = x_mask, other = 0.0)
+
+    # permute matrices
+    y_re = tl.permute(x_re, (0, 2, 1))
+    y_im = tl.permute(x_im, (0, 2, 1))
+
+    # store
+    tl.store(y_re_ptr + y_offs, y_re, mask = y_mask)
+    tl.store(y_im_ptr + y_offs, y_im, mask = y_mask)
 
 # =============================================================================
 # F4: tcFFT radix-16 single-program FFT (N = 256, L = 2)
@@ -363,8 +577,60 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
 
     TODO: implement.
     """
-    raise NotImplementedError("TODO: implement f3_launch")
+    # access dimensions
+    N1 = plan['N1']
+    N2 = plan['N2']
+    N = plan['N']
+    
+    # access and define variables for f2a
+    tw_re_f2a = plan['tw_re_n2']
+    tw_im_f2a = plan['tw_im_n2']
+    perm_f2a = plan['perm_n2']
+    LOG2_N_f2a = plan['LOG2_N2']
+    BAILEY_EPILOGUE_f2a = True
+    STRIDED_STORE_f2a = False
+    OUTER_DIM_f2a = N1
+    N_f2a = N2
+    
+    # access and define variables for f2b
+    tw_re_f2b = plan['tw_re_n1']
+    tw_im_f2b = plan['tw_im_n1']
+    perm_f2b = plan['perm_n1']
+    LOG2_N_f2b = plan['LOG2_N1']
+    BAILEY_EPILOGUE_f2b = False
+    STRIDED_STORE_f2b = True
+    OUTER_DIM_f2b = N2
+    N_f2b = N1
+    
+    # define total N and bailey twiddles; both do not change between f2a and f2b
+    N_TOTAL = N
+    bt_re = plan['bt_re']
+    bt_im = plan['bt_im']
+    
 
+    # calculate grid sizes
+    grid_f2a = (B*N1,)
+    grid_f2b = (B*N2,)
+
+    # calculate first transpose (T1)
+    _transpose(in_re, in_im, mid_re, mid_im, B, N2, N1)
+
+    # first f2 function call (F2-A)
+    f2_kernel[grid_f2a](mid_re, mid_im, out_re, out_im, tw_re_f2a, tw_im_f2a,
+                      perm_f2a, bt_re, bt_im, OUTER_DIM = OUTER_DIM_f2a,
+                      N_TOTAL = N_TOTAL, N = N_f2a, LOG2_N = LOG2_N_f2a,
+                      BAILEY_EPILOGUE = BAILEY_EPILOGUE_f2a,
+                      STRIDED_STORE = STRIDED_STORE_f2a)
+
+    # calculate second transpose (T2)
+    _transpose(out_re, out_im, mid_re, mid_im, B, N1, N2)
+
+    # second f2 function call (F2-B)
+    f2_kernel[grid_f2b](mid_re, mid_im, out_re, out_im, tw_re_f2b, tw_im_f2b,
+                      perm_f2b, bt_re, bt_im, OUTER_DIM = OUTER_DIM_f2b,
+                      N_TOTAL = N_TOTAL, N = N_f2b, LOG2_N = LOG2_N_f2b,
+                      BAILEY_EPILOGUE = BAILEY_EPILOGUE_f2b,
+                      STRIDED_STORE = STRIDED_STORE_f2b)
 
 # =============================================================================
 # F5 pipeline: 6-step Bailey at N1=N2=256 with F4 as inner FFT
