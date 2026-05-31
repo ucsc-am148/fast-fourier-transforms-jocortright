@@ -209,7 +209,7 @@ def make_dft_R_padded(
     MAX_R = 16
 
     # calculate dft matrix
-    (dft_re, dft_im) = make_dft_matrix(R, torch.float16, device)
+    (dft_re, dft_im) = make_dft_matrix(R, dtype = torch.float16, device = device)
     
     # initialize arrays
     M_re = torch.zeros((MAX_R, MAX_R), dtype = torch.float16)

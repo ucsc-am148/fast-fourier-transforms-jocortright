@@ -83,7 +83,9 @@ def f6_factor(N: int) -> list[int]:
     n256, rb = divmod(k, 8)
     n16, rb2 = divmod(rb, 4)
     rsmall = 1 << rb2
-    chunks = [256] * n256 + [16] * n16 + ([rsmall] if rsmall > 1 else [])
+    chunks = [256] * n256 + [16] * n16
+    if (rsmall > 1):
+        chunks.append(rsmall)
     assert math.prod(chunks) == N
     return chunks
 
@@ -622,7 +624,7 @@ def dft_kernel(
         inner = b_offs % M
         
         # combine to get total offset
-        y_offs = outer*R*M + r_offs*M + inner
+        y_offs = outer*M*R + r_offs*M + inner
     else:
         # regular y offset
         y_offs = x_offs
@@ -927,15 +929,8 @@ def _f6_rec(cur_re, cur_im, rows, chunks, plan, cyc):
     # note that we have to access these AFTER we run the leaf case
     tw_re, tw_im = _lookup_tw(plan = plan, m0 = m0, M = M, N_i = N_i)
 
-    # preload cycs
-    transpose_1_re, transpose_1_im = cyc.next() # for T1
-                                                # [no load for recursion]
-    scale_re, scale_im = cyc.next()             # for scale
-    transpose_2_re, transpose_2_im = cyc.next() # for T2
-    fftm0_re, fftm0_im = cyc.next()             # for FFT-m0
-    y_re, y_im = cyc.next()                     # for T3 and our output
-
     # first transpose (T1)
+    transpose_1_re, transpose_1_im = cyc.next()
     _transpose(cur_re, cur_im, transpose_1_re, transpose_1_im, rows, M, m0)
 
     # first FFT, uses recursion and is of length M
@@ -943,17 +938,21 @@ def _f6_rec(cur_re, cur_im, rows, chunks, plan, cyc):
                               chunks = chunks_f6_rec, plan = plan, cyc = cyc)
 
     # scale
+    scale_re, scale_im = cyc.next()
     _scale(rec_re, rec_im, scale_re, scale_im, rows = rows,
             m0 = m0, M = M, twr = tw_re, twi = tw_im)
 
     # second transpose (T2)
+    transpose_2_re, transpose_2_im = cyc.next()
     _transpose(scale_re, scale_im, transpose_2_re, transpose_2_im, rows, m0, M)
 
     # second FFT, uses plain _fft_chunk and is of length m_0 (FFT-m_0)
+    fftm0_re, fftm0_im = cyc.next()
     _fft_chunk(transpose_2_re, transpose_2_im, fftm0_re, fftm0_im,
                 rows = rows_fft_m0, m = m0, plan = plan)
 
     # final transpose (T3)
+    y_re, y_im = cyc.next()
     _transpose(fftm0_re, fftm0_im, y_re, y_im, rows, M, m0)
 
     return y_re, y_im
@@ -986,13 +985,8 @@ def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
     # note that we have to access these AFTER we run the leaf case
     tw_re, tw_im = _lookup_tw(plan = plan, m0 = m0, M = M, N_i = N_i)
 
-    # preload cycs
-    transpose_1_re, transpose_1_im = cyc.next()     # for T1
-                                                    # [recursion, no load]
-    scale_trans_2_re, scale_trans_2_im = cyc.next() # for scale & T2
-    y_re, y_im = cyc.next()                         # for FFT-m0 & T3, output
-    
     # first transpose (T1)
+    transpose_1_re, transpose_1_im = cyc.next()
     _transpose(cur_re, cur_im, transpose_1_re, transpose_1_im, rows, M, m0)
 
     # first FFT, uses recursion and is of length M
@@ -1000,10 +994,12 @@ def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
                             chunks = chunks_f7_rec, plan = plan, cyc = cyc)
 
     # scale and second transpose (scale + T2)
+    scale_trans_2_re, scale_trans_2_im = cyc.next()
     _scale(rec_re, rec_im, scale_trans_2_re, scale_trans_2_im,
           rows = rows, m0 = m0, M = M, twr = tw_re, twi = tw_im, store_t = True)
 
     # second FFT and third and final transpose (FFT-m0 + T3)
+    y_re, y_im = cyc.next()
     _fft_chunk(scale_trans_2_re, scale_trans_2_im, y_re, y_im,
               rows = rows_fft_m0, m = m0, plan = plan, M = M, store_t = True)
 
