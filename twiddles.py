@@ -93,23 +93,43 @@ def make_radix16_twiddles(
 
     # initialize variables
     L = math.ceil(math.log2(N)/math.log2(BASE))
-    k = torch.arange(BASE, dtype = torch.float16)
+    m = torch.arange(BASE, dtype = torch.float16)[:, None]
+    c = torch.arange(N//BASE, dtype = torch.float16)
     
     # initialize arrays
     tw_re = torch.ones((L, BASE, N//BASE), dtype = torch.float16)
     tw_im = torch.zeros((L, BASE, N//BASE), dtype = torch.float16)   
     
-    # populate arrays
-    for s in range(L):
-        # skip first stage
-        if s != 0:
-            # redefine K and calculate omega
-            K = N/(BASE**(s + 1))
-            omega = -2.0*math.pi*(k[:, None]*torch.arange(N//BASE, dtype = torch.float16)*K)/N
+    # create array with labels
+    labeled_array = _column_axis_labeling(L)
+
+    # populate arrays, start from 1 to skip the first step
+    for s in range(1, L):
+        # access current list of labels
+        labels = labeled_array[s]
+        
+        # define t vector
+        t = torch.zeros((N//BASE,), dtype = torch.float16)[None, :]
+        
+        # for all j, we need to find corresponding root of unity
+        for j in range(s):
+            # go through each tuple
+            for pos, label in enumerate(labels):
+                # this is what we are looking for, now we do our calculations
+                if label == ('e', L - 1 - j):
+                    # calculate value at index c
+                    shift = L - 2 - pos
+                    val = (c // (BASE**shift)) % BASE
+
+                    # sum up values
+                    t += val*(16**j)
+        
+        # calculate angles to be stored
+        omega = -2*math.pi*(m*t)/(BASE**(s + 1))
             
-            # insert into arrays
-            tw_re[s] = torch.cos(omega)
-            tw_im[s] = torch.sin(omega)
+        # insert into arrays
+        tw_re[s] = torch.cos(omega)
+        tw_im[s] = torch.sin(omega)
             
     return (tw_re.to(device), tw_im.to(device))
 
@@ -132,11 +152,11 @@ def make_bailey_cross_twiddles(
     Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
     """
     # define indices
-    m0_offs = torch.arange(m0, dtype = torch.float64)
-    M_offs = torch.arange(M, dtype = torch.float64)
+    n1 = torch.arange(m0, dtype = torch.float32)[:, None]
+    kM = torch.arange(M, dtype = torch.float32)[None, :]
     
     # calculate omegas
-    omega = -2*math.pi*(m0_offs[:, None]*M_offs[None, :])/N
+    omega = -2*math.pi*(n1*kM)/N
 
     # calculate and store twiddles
     tw_re = torch.cos(omega)

@@ -231,11 +231,11 @@ def f2_kernel(
     # program id
     pid = tl.program_id(axis = 0)
 
-    # define offset for perm vector
-    N_range = tl.arange(0, N) 
+    # define indices spanning N, used multiple times
+    j = tl.arange(0, N) 
 
-    # define masks
-    perm = tl.load(perm_ptr + N_range)
+    # load perm vector
+    perm = tl.load(perm_ptr + j)
     
     # define x offset
     x_offs = pid*N + perm
@@ -250,56 +250,54 @@ def f2_kernel(
 
     # run each butterfly level
     for s in tl.static_range(0, LOG2_N):
-        # calculate cutoff
+        # define variable to represent 2^s in order to divide vectors evenly
         half = 1 << s
-        full = half << 1
 
-        # calculate position
-        less_full = full - 1
-        pos = N_range & less_full
-        
-        # decide if in low or high half
-        low_half = pos < half
+        # determine offset partner by bitwise XOR
+        partner = j ^ half
 
-        # define offsets
-        lo_offs = tl.where(low_half, N_range, N_range - half)
-        hi_offs = lo_offs + half
+        # pick out partner elements using tl.gather
+        v_partner_re = tl.gather(v_re, partner, axis = 0)
+        v_partner_im = tl.gather(v_im, partner, axis = 0)
 
-        # accumulate low values
-        lo_re = v_re.gather(lo_offs, axis=0)
-        lo_im = v_im.gather(lo_offs, axis=0)
+        # divide N by 2^(s+1) to determine how many twiddles are needed
+        num_twiddles = N >> (s + 1)
 
-        # accumulate high values
-        hi_re = v_re.gather(hi_offs, axis=0)
-        hi_im = v_im.gather(hi_offs, axis=0)
+        # mask and calculate j mod 2^s to specify which twiddles to load
+        mask = j & (half - 1)
 
-        # index into the radix-2 twiddle table
-        tw_offs = (lo_offs & (half - 1)) * (N >> (s + 1))
+        # define twiddle offset and load
+        tw_offs = mask * num_twiddles
+        tw_re = tl.load(tw_re_ptr + tw_offs)
+        tw_im = tl.load(tw_im_ptr + tw_offs)
 
-        # load temporary pointers
-        tmp_re = tl.load(tw_re_ptr + tw_offs)
-        tmp_im = tl.load(tw_im_ptr + tw_offs)
+        # decide which half by comparing leading bit; if not 0 then upper half
+        is_high = (j & half) != 0
 
-        # update and twiddle
-        tw_re = tmp_re*hi_re - tmp_im*hi_im
-        tw_im = tmp_re*hi_im + tmp_im*hi_re
+        # load values depending on boolean; partner will never be in same half
+        lo_re = tl.where(is_high, v_partner_re, v_re)
+        lo_im = tl.where(is_high, v_partner_im, v_im)
+        hi_re = tl.where(is_high, v_re, v_partner_re)
+        hi_im = tl.where(is_high, v_im, v_partner_im)
 
-        # update low values
-        low_re_outs = lo_re + tw_re
-        low_im_outs = lo_im + tw_im
+        # calculate twiddles for high values
+        tw_hi_re = tw_re*hi_re - tw_im*hi_im
+        tw_hi_im = tw_re*hi_im + tw_im*hi_re
 
-        # update high values
-        high_re_outs = lo_re - tw_re
-        high_im_outs = lo_im - tw_im
+        # now the butterfly, add if upper half and subtract if lower half
+        new_lo_re = lo_re - tw_hi_re
+        new_lo_im = lo_im - tw_hi_im
+        new_hi_re = lo_re + tw_hi_re
+        new_hi_im = lo_im + tw_hi_im
 
-        # update v to v_new
-        v_re = tl.where(low_half, low_re_outs, high_re_outs)
-        v_im = tl.where(low_half, low_im_outs, high_im_outs)
+        # store, ready for next loop/steps
+        v_re = tl.where(is_high, new_lo_re, new_hi_re)
+        v_im = tl.where(is_high, new_lo_im, new_hi_im)
     
 # for F3 -----------------------------------------------------------------------
     if BAILEY_EPILOGUE:
         # calculate bailey twiddle offsets
-        bt_offs = (pid % OUTER_DIM)*N + N_range
+        bt_offs = (pid % OUTER_DIM)*N + j
 
         # load bailey twiddle matrices
         bt_re = tl.load(bt_re_ptr + bt_offs)
@@ -318,11 +316,11 @@ def f2_kernel(
         stride = pid//OUTER_DIM
 
         # calculate y offsets
-        y_offs = pid + OUTER_DIM*N_range + stride*(N_TOTAL - OUTER_DIM)
+        y_offs = pid + OUTER_DIM*j + stride*(N_TOTAL - OUTER_DIM)
     
     else:
         # calculate y offsets without striding
-        y_offs = pid*N + N_range
+        y_offs = pid*N + j
     
     # store results
     tl.store(y_re_ptr + y_offs, v_re)
