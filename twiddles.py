@@ -36,9 +36,12 @@ def make_radix2_twiddles(
     # define k values
     k = torch.arange(N//2, dtype = dtype)
     
+    # calculate omega
+    omega = -2*math.pi*k/N
+
     # calculate and store twiddles
-    tw_re = torch.cos(-2*math.pi*k/N)
-    tw_im = torch.sin(-2*math.pi*k/N)
+    tw_re = torch.cos(omega)
+    tw_im = torch.sin(omega)
     
     return (tw_re.to(device), tw_im.to(device))
 
@@ -85,21 +88,24 @@ def make_radix16_twiddles(
     where e_{L-1-j}_value(c) reads the base-16 digit of c at the position
     given by _column_axis_labeling(L)[s].
     """
+    # define constant base
+    BASE = 16
+
     # initialize variables
-    L = math.ceil(math.log2(N)/math.log2(16.0))
-    k = torch.arange(16, dtype = torch.float16)
+    L = math.ceil(math.log2(N)/math.log2(BASE))
+    k = torch.arange(BASE, dtype = torch.float16)
     
     # initialize arrays
-    tw_re = torch.ones((L, 16, N//16), dtype = torch.float16)
-    tw_im = torch.zeros((L, 16, N//16), dtype = torch.float16)   
+    tw_re = torch.ones((L, BASE, N//BASE), dtype = torch.float16)
+    tw_im = torch.zeros((L, BASE, N//BASE), dtype = torch.float16)   
     
     # populate arrays
     for s in range(L):
         # skip first stage
         if s != 0:
-            # define variables
-            K = N/(16**(s + 1))
-            omega = -2.0*math.pi*(k[:, None]*torch.arange(N//16, dtype = torch.float16)*K)/N
+            # redefine K and calculate omega
+            K = N/(BASE**(s + 1))
+            omega = -2.0*math.pi*(k[:, None]*torch.arange(N//BASE, dtype = torch.float16)*K)/N
             
             # insert into arrays
             tw_re[s] = torch.cos(omega)
@@ -126,12 +132,19 @@ def make_bailey_cross_twiddles(
     Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
     """
     # define indices
-    m0_idx = torch.arange(m0, dtype = dtype)
-    M_idx = torch.arange(M, dtype = dtype)
+    m0_offs = torch.arange(m0, dtype = torch.float64)
+    M_offs = torch.arange(M, dtype = torch.float64)
     
+    # calculate omegas
+    omega = -2*math.pi*(m0_offs[:, None]*M_offs[None, :])/N
+
     # calculate and store twiddles
-    tw_re = torch.cos(-2*math.pi*(m0_idx[:, None]*M_idx[None, :])/N)
-    tw_im = torch.sin(-2*math.pi*(m0_idx[:, None]*M_idx[None, :])/N)
+    tw_re = torch.cos(omega)
+    tw_im = torch.sin(omega)
+
+    # convert twiddles from fp32 to fp16
+    tw_re = tw_re.to(dtype)
+    tw_im = tw_im.to(dtype)
     
     return (tw_re.to(device), tw_im.to(device))
 
@@ -155,8 +168,10 @@ def make_dft_matrix(
     # populate arrays
     for k in range(N):
         for j in range(N):
-            W_re[j, k] = math.cos(-2*math.pi*j*k/N)
-            W_im[j, k] = math.sin(-2*math.pi*j*k/N)
+            # calculate omega and store twiddle
+            omega = -2*math.pi*j*k/N
+            W_re[j, k] = math.cos(omega)
+            W_im[j, k] = math.sin(omega)
 
     return (W_re.to(device), W_im.to(device))
 
@@ -170,12 +185,15 @@ def make_dft_R_padded(
     first R columns are F_R (rows wrap mod R), take the first R output rows.
     This makes the >=16x16 tl.dot requirement hold for all R in {2, 4, 8, 16}.
     """
+    # define max constant
+    MAX_R = 16
+
     # calculate dft matrix
     (dft_re, dft_im) = make_dft_matrix(R, torch.float16, device)
     
     # initialize arrays
-    M_re = torch.zeros((16, 16), dtype = torch.float16)
-    M_im = torch.zeros((16, 16), dtype = torch.float16)
+    M_re = torch.zeros((MAX_R, MAX_R), dtype = torch.float16)
+    M_im = torch.zeros((MAX_R, MAX_R), dtype = torch.float16)
 
     # insert dft matrix into arrays; overwrite zeros starting from [0, 0]
     M_re[:dft_re.size(0), :dft_re.size(1)] = dft_re
@@ -191,12 +209,12 @@ def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
     """
     # initialize variables
     n_bits = math.ceil(math.log2(N))
-    idx = torch.arange(N, dtype = torch.int32)
+    offs = torch.arange(N, dtype = torch.int32)
     rev = torch.zeros((N,), dtype = torch.int32)
     
     # populate rev array
     for i in range(n_bits):
-        rev = (rev << 1) | (idx & 1)
-        idx = idx >> 1
+        rev = (rev << 1) | (offs & 1)
+        offs = offs >> 1
 
     return rev.to(device)
